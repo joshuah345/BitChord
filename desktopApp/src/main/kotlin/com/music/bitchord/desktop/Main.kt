@@ -14,7 +14,9 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.Density
 import androidx.compose.ui.window.Window
 import androidx.compose.ui.window.WindowPosition
 import androidx.compose.ui.window.application
@@ -26,6 +28,9 @@ import java.awt.Rectangle
 import java.awt.Toolkit
 import kotlin.math.roundToInt
 import org.jetbrains.compose.resources.painterResource
+
+private val userScale: Float =
+    System.getenv("BITCHORD_SCALE")?.toFloatOrNull()?.coerceIn(0.5f, 4f) ?: 1f
 
 fun main() {
     // Before anything touches AWT: macOS reads how the app's windows and menus look only once.
@@ -119,8 +124,8 @@ private fun desktopMain() = application {
             val scaleX = if (DesktopPlatform.isMac) 1.0 else transform.scaleX
             val scaleY = if (DesktopPlatform.isMac) 1.0 else transform.scaleY
             composeWindow.minimumSize = Dimension(
-                (MIN_WINDOW_WIDTH_DP * scaleX).roundToInt(),
-                (MIN_WINDOW_HEIGHT_DP * scaleY).roundToInt(),
+                (MIN_WINDOW_WIDTH_DP * scaleX * userScale).roundToInt(),
+                (MIN_WINDOW_HEIGHT_DP * scaleY * userScale).roundToInt(),
             )
             // Setting AWT's minimum during the first composition can resize the native peer to
             // that minimum without updating Compose's state. Compose would then keep laying out a
@@ -128,8 +133,8 @@ private fun desktopMain() = application {
             // boundary off-screen until a maximize/restore cycle synchronised the two. Re-assert
             // the requested opening size on the native peer so both layers start in agreement.
             composeWindow.size = Dimension(
-                (openingSize.width.value * scaleX).roundToInt(),
-                (openingSize.height.value * scaleY).roundToInt(),
+                (openingSize.width.value * scaleX * userScale).roundToInt(),
+                (openingSize.height.value * scaleY * userScale).roundToInt(),
             )
             // The resize above keeps the corner where it was, which is no longer the middle.
             if (DesktopPlatform.isMac) {
@@ -172,9 +177,14 @@ private fun desktopMain() = application {
                 close = { if (DesktopWindowVisibility.onCloseRequest()) exitApplication() },
             )
         }
+        val baseDensity = LocalDensity.current
         CompositionLocalProvider(
             LocalDesktopWindowActions provides actions,
             LocalDesktopWindowScope provides this,
+            LocalDensity provides Density(
+                baseDensity.density * userScale,
+                baseDensity.fontScale,
+            ),
         ) {
             BitChordDesktopApp()
         }
