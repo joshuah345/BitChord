@@ -97,6 +97,7 @@ internal class DesktopMprisController(
     private var publishedLoopStatus = "None"
     private var publishedRate = 1.0
     private var publishedVolume = 1.0
+    private var publishedCaps: Map<String, Boolean> = emptyMap()
 
     fun start() {
         if (!isLinux() || synchronized(lock) { started }) return
@@ -146,6 +147,18 @@ internal class DesktopMprisController(
         publish(force = false)
     }
 
+    private fun capabilities(playback: DesktopPlaybackState): Map<String, Boolean> {
+        val hasSong = playback.song != null
+        return linkedMapOf(
+            "CanGoNext" to hasSong,
+            "CanGoPrevious" to hasSong,
+            "CanPlay" to (hasSong && playback.error == null),
+            "CanPause" to hasSong,
+            "CanSeek" to (hasSong && durationMs(playback.song, playback.durationMs) > 0L),
+            "CanControl" to true,
+        )
+    }
+
     private fun publish(force: Boolean) {
         val currentConnection: DBusConnection
         val changed: MutableMap<String, Variant<*>>
@@ -171,6 +184,11 @@ internal class DesktopMprisController(
             if (force || publishedVolume != state.volume.toDouble()) {
                 changed["Volume"] = variant(state.volume.toDouble().coerceIn(0.0, 1.0))
             }
+            val caps = capabilities(state)
+            caps.forEach { (name, value) ->
+                if (force || publishedCaps[name] != value) changed[name] = variant(value)
+            }
+            publishedCaps = caps
             publishedSongId = state.song?.videoId
             publishedPlaybackStatus = playbackStatus
             publishedShuffle = shuffle
