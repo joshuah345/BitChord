@@ -9,17 +9,23 @@ import org.freedesktop.dbus.annotations.DBusProperty
 import org.freedesktop.dbus.annotations.DBusProperty.Access
 import org.freedesktop.dbus.connections.impl.DBusConnection
 import org.freedesktop.dbus.connections.impl.DBusConnectionBuilder
+import org.freedesktop.dbus.exceptions.DBusException
 import org.freedesktop.dbus.exceptions.DBusExecutionException
 import org.freedesktop.dbus.interfaces.DBusInterface
 import org.freedesktop.dbus.interfaces.Properties
+import org.freedesktop.dbus.messages.DBusSignal
 import org.freedesktop.dbus.types.Variant
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import kotlin.math.abs
 
 private const val MPRIS_ROOT_INTERFACE = "org.mpris.MediaPlayer2"
 private const val MPRIS_PLAYER_INTERFACE = "org.mpris.MediaPlayer2.Player"
 private const val MPRIS_OBJECT_PATH = "/org/mpris/MediaPlayer2"
 private const val MPRIS_BUS_NAME = "org.mpris.MediaPlayer2.bitchord"
+
+/** A position change bigger than this, beyond what normal playback explains, is announced as a seek. */
+private const val SEEK_JUMP_MS = 2_500L
 
 interface MprisMetadataType : TypeRef<Map<String, Variant<*>>>
 
@@ -66,6 +72,10 @@ interface MprisPlayer : DBusInterface {
     fun Seek(offsetUs: Long)
     fun SetPosition(trackId: DBusPath, positionUs: Long)
     fun OpenUri(uri: String)
+
+    /** Emitted when the position jumps; clients resync their progress bar from it. */
+    class Seeked @Throws(DBusException::class) constructor(path: String, val position: Long) :
+        DBusSignal(path, position)
 }
 
 /** Publishes the desktop player's state through the standard Linux MPRIS session-bus interfaces. */
@@ -79,7 +89,8 @@ internal class DesktopMprisController(
     private val onLoopStatusChanged: (String) -> Unit,
     private val onRateChanged: (Double) -> Unit,
     private val onVolumeChanged: (Double) -> Unit,
-    private val onSeek: (Long) -> Unit,
+    /** Absolute position in ms. Returns false when the seek was refused (e.g. controls locked). */
+    private val onSeek: (Long) -> Boolean,
 ) {
     private val lock = Any()
     private val worker: ExecutorService = Executors.newSingleThreadExecutor { runnable ->
@@ -91,13 +102,20 @@ internal class DesktopMprisController(
     private var shuffle = false
     private var loopStatus = "None"
     private var rate = 1.0
+
+    // What clients were last told, so only real changes are published.
     private var publishedSongId: String? = null
+    private var publishedDurationMs = 0L
     private var publishedPlaybackStatus: String? = null
     private var publishedShuffle = false
     private var publishedLoopStatus = "None"
     private var publishedRate = 1.0
     private var publishedVolume = 1.0
     private var publishedCaps: Map<String, Boolean> = emptyMap()
+
+    // Anchor for extrapolating Position between updates.
+    private var lastPositionMs = 0L
+    private var lastUpdateNanos = System.nanoTime()
 
     fun start() {
         if (!isLinux() || synchronized(lock) { started }) return
@@ -138,13 +156,82 @@ internal class DesktopMprisController(
         loopStatus: String,
         rate: Double,
     ) {
+        var seekedToMs: Long? = null
         synchronized(lock) {
+            val now = System.nanoTime()
+            val elapsedMs =
+                if (state.isPlaying) ((now - lastUpdateNanos) / 1_000_000.0 * this.rate).toLong() else 0L
+            val expected = lastPositionMs + elapsedMs
+            val newSong = state.song?.videoId != playback.song?.videoId
+            if (playback.song != null && (newSong || abs(playback.positionMs - expected) > SEEK_JUMP_MS)) {
+                seekedToMs = playback.positionMs.coerceAtLeast(0L)
+            }
+            lastPositionMs = playback.positionMs
+            lastUpdateNanos = now
+
             state = playback
             this.shuffle = shuffle
             this.loopStatus = loopStatus
             this.rate = rate.coerceIn(0.25, 3.0)
         }
-        publish(force = false)
+        publish(force = false) // Metadata first, so clients know the new track...
+        seekedToMs?.let(::emitSeeked) // ...then where in it we are
+    }
+
+    /** Relative seek from a client: [deltaMs] is added to the current position. */
+    fun seekBy(deltaMs: Long) {
+        val (target, duration) = synchronized(lock) {
+            (currentPositionMs() + deltaMs) to durationMs(state.song, state.durationMs)
+        }
+        when {
+            target < 0L -> performSeek(0L)
+            duration > 0L && target > duration -> onNext() // the spec says seeking past the end skips
+            else -> performSeek(target)
+        }
+    }
+
+    /** Absolute seek from a client, for a specific track. */
+    fun setPosition(trackId: String, positionMs: Long) {
+        val (song, duration) = synchronized(lock) { state.song to durationMs(state.song, state.durationMs) }
+        if (song == null || trackPath(song) != trackId) return // stale request for a previous track
+        if (positionMs < 0L || (duration > 0L && positionMs > duration)) return
+        performSeek(positionMs)
+    }
+
+    /** Call whenever the position is moved by anything other than normal playback. */
+    fun notifySeeked(positionMs: Long) {
+        val position = positionMs.coerceAtLeast(0L)
+        synchronized(lock) {
+            // Re-anchor the extrapolation, so Position polls are right immediately.
+            lastPositionMs = position
+            lastUpdateNanos = System.nanoTime()
+            state = state.copy(positionMs = position) // assumes DesktopPlaybackState is a data class
+        }
+        // Keep D-Bus I/O off the caller's thread; the worker is gone after stop().
+        runCatching { worker.execute { emitSeeked(position) } }
+    }
+
+    private fun performSeek(positionMs: Long) {
+        if (onSeek(positionMs)) notifySeeked(positionMs)
+    }
+
+    private fun emitSeeked(positionMs: Long) {
+        val bus = synchronized(lock) { connection } ?: return
+        runCatching {
+            bus.sendMessage(MprisPlayer.Seeked(MPRIS_OBJECT_PATH, positionMs * 1_000L))
+        }.onFailure { System.err.println("BitChord MPRIS: Seeked failed: ${it.message}") }
+    }
+
+    /** Call with [lock] held. */
+    private fun currentPositionMs(): Long {
+        val base = state.positionMs.coerceAtLeast(0L)
+        val position = if (state.isPlaying) {
+            base + ((System.nanoTime() - lastUpdateNanos) / 1_000_000.0 * rate).toLong()
+        } else {
+            base
+        }
+        val duration = durationMs(state.song, state.durationMs)
+        return if (duration > 0L) position.coerceAtMost(duration) else position
     }
 
     private fun capabilities(playback: DesktopPlaybackState): Map<String, Boolean> {
@@ -165,8 +252,11 @@ internal class DesktopMprisController(
         synchronized(lock) {
             currentConnection = connection ?: return
             val playbackStatus = playbackStatus(state)
+            val songId = state.song?.videoId
+            val duration = durationMs(state.song, state.durationMs)
             changed = linkedMapOf()
-            if (force || publishedSongId != state.song?.videoId) {
+            // Duration is part of Metadata (mpris:length) and often arrives after the song starts.
+            if (force || publishedSongId != songId || publishedDurationMs != duration) {
                 changed["Metadata"] = variant(metadata(state.song), "a{sv}")
             }
             if (force || publishedPlaybackStatus != playbackStatus) {
@@ -189,7 +279,8 @@ internal class DesktopMprisController(
                 if (force || publishedCaps[name] != value) changed[name] = variant(value)
             }
             publishedCaps = caps
-            publishedSongId = state.song?.videoId
+            publishedSongId = songId
+            publishedDurationMs = duration
             publishedPlaybackStatus = playbackStatus
             publishedShuffle = shuffle
             publishedLoopStatus = loopStatus
@@ -209,9 +300,13 @@ internal class DesktopMprisController(
         }
     }
 
-    /** One property, answered from the same table as [allProperties]. */
-    private fun property(interfaceName: String, propertyName: String): Variant<*> =
-        allProperties(interfaceName)[propertyName] ?: unknownProperty(interfaceName, propertyName)
+    /** One property. Position is answered directly, since clients poll it often. */
+    private fun property(interfaceName: String, propertyName: String): Variant<*> {
+        if (interfaceName == MPRIS_PLAYER_INTERFACE && propertyName == "Position") {
+            return variant(synchronized(lock) { currentPositionMs() } * 1_000L)
+        }
+        return allProperties(interfaceName)[propertyName] ?: unknownProperty(interfaceName, propertyName)
+    }
 
     private fun allProperties(interfaceName: String): Map<String, Variant<*>> = when (interfaceName) {
         MPRIS_ROOT_INTERFACE -> linkedMapOf(
@@ -227,23 +322,20 @@ internal class DesktopMprisController(
             ),
         )
         MPRIS_PLAYER_INTERFACE -> synchronized(lock) {
-            linkedMapOf(
+            linkedMapOf<String, Variant<*>>(
                 "Metadata" to variant(metadata(state.song), "a{sv}"),
                 "PlaybackStatus" to variant(playbackStatus(state)),
                 "LoopStatus" to variant(loopStatus),
                 "Rate" to variant(rate),
                 "Shuffle" to variant(shuffle),
                 "Volume" to variant(state.volume.toDouble().coerceIn(0.0, 1.0)),
-                "Position" to variant(state.positionMs.coerceAtLeast(0L) * 1_000L),
+                "Position" to variant(currentPositionMs() * 1_000L),
                 "MinimumRate" to variant(0.25),
                 "MaximumRate" to variant(3.0),
-                "CanGoNext" to variant(state.song != null),
-                "CanGoPrevious" to variant(state.song != null),
-                "CanPlay" to variant(state.song != null && state.error == null),
-                "CanPause" to variant(state.song != null),
-                "CanSeek" to variant(state.song != null && durationMs(state.song, state.durationMs) > 0L),
-                "CanControl" to variant(true),
-            )
+            ).also { map ->
+                // Same source as publish(), so the two cannot drift apart.
+                capabilities(state).forEach { (name, value) -> map[name] = variant(value) }
+            }
         }
         else -> unknownProperty(interfaceName, "")
     }
@@ -323,13 +415,11 @@ internal class DesktopMprisController(
 
         override fun PlayPause() = controller.onPlayPause()
 
-        override fun Seek(offsetUs: Long) {
-            controller.onSeek(offsetUs / 1_000L)
-        }
+        // Seek is relative, SetPosition is absolute and names the track it was meant for.
+        override fun Seek(offsetUs: Long) = controller.seekBy(offsetUs / 1_000L)
 
-        override fun SetPosition(trackId: DBusPath, positionUs: Long) {
-            controller.onSeek(positionUs / 1_000L)
-        }
+        override fun SetPosition(trackId: DBusPath, positionUs: Long) =
+            controller.setPosition(trackId.path, positionUs / 1_000L)
 
         override fun OpenUri(uri: String) = Unit
 

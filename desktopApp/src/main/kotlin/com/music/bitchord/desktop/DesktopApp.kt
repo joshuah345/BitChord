@@ -1577,9 +1577,12 @@ fun BitChordDesktopApp() {
                 persistence.saveString("volume", volume.toString())
             },
             onSeek = { positionMs ->
-                if (!DesktopListenTogether.state.value.controlsLocked) {
+                if (DesktopListenTogether.state.value.controlsLocked) {
+                    false
+                } else {
                     playbackEngine.seekTo(positionMs)
                     partySync.onLocalIntent()
+                    true
                 }
             },
         )
@@ -1785,6 +1788,7 @@ fun BitChordDesktopApp() {
         playback.song?.videoId,
         playback.isPlaying,
         playback.durationMs,
+        playback.positionMs,
         playback.volume,
         playback.error,
         shuffle,
